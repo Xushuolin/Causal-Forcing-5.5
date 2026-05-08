@@ -5,6 +5,7 @@ from .gan import GAN
 from .sid import SiD
 from .ode_regression import ODERegression
 from .naive_consistency import NaiveConsistency
+from .frame_preservation import CompressionBranch, FramePreservationDiffusion, LightweightHistoryEncoder
 
 __all__ = [
     "CausalDiffusion",
@@ -13,5 +14,8 @@ __all__ = [
     "GAN",
     "SiD",
     "ODERegression",
-    "NaiveConsistency"
+    "NaiveConsistency",
+    "FramePreservationDiffusion",
+    "LightweightHistoryEncoder",
+    "CompressionBranch"
 ]
