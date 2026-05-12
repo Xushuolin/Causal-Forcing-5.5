@@ -2,7 +2,7 @@ import gc
 import logging
 
 from model import CausalDiffusion, FramePreservationDiffusion
-from utils.dataset import cycle, LatentLMDBDataset, LongHistoryLatentDataset
+from utils.dataset import cycle, LatentLMDBDataset, LongHistoryLatentDataset, LongHistoryVideoDataset
 from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
@@ -109,6 +109,18 @@ class Trainer:
                 frame_stride=getattr(config, "history_frame_stride", 1),
                 window_sampling=getattr(config, "history_window_sampling", "random"),
                 pad_short_videos=getattr(config, "pad_short_videos", True),
+            )
+        elif dataset_type == "long_history_video_manifest":
+            dataset = LongHistoryVideoDataset(
+                config.data_path,
+                hr_num_frames=getattr(config, "hr_num_video_frames", 480),
+                lr_num_frames=getattr(config, "lr_num_video_frames", 240),
+                hr_size=tuple(getattr(config, "hr_video_size", [480, 832])),
+                lr_size=tuple(getattr(config, "lr_video_size", [120, 208])),
+                window_sampling=getattr(config, "history_window_sampling", "random"),
+                pad_short_videos=getattr(config, "pad_short_videos", True),
+                temporal_span_frames=getattr(config, "temporal_span_frames", None),
+                lr_sample_strategy=getattr(config, "lr_sample_strategy", "uniform"),
             )
         else:
             dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
@@ -234,17 +246,19 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
-        if not self.config.load_raw_video:  # precomputed latent
+        if hasattr(self.model, "encode_video_batch") and "hr_frames" in batch and "lr_frames" in batch:
+            clean_latent = self.model.encode_video_batch(batch, device=self.device, dtype=self.dtype)
+        elif not self.config.load_raw_video:  # precomputed latent
             clean_latent = batch["clean_latent"].to(
                 device=self.device, dtype=self.dtype)
         else:  # encode raw video to latent
             frames = batch["frames"].to(
                 device=self.device, dtype=self.dtype)
-           
+
             with torch.no_grad():
                 clean_latent = self.model.vae.encode_to_latent(
                     frames).to(device=self.device, dtype=self.dtype)
-        image_latent = clean_latent[:, 0:1, ]
+        image_latent = clean_latent["lr"][:, 0:1, ] if isinstance(clean_latent, dict) else clean_latent[:, 0:1, ]
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)

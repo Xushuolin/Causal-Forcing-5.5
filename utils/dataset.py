@@ -1,5 +1,7 @@
 from utils.lmdb_ import get_array_shape_from_lmdb, retrieve_row_from_lmdb
 from torch.utils.data import Dataset
+import torch.nn.functional as F
+from torchvision.io import read_video
 import numpy as np
 import torch
 import lmdb
@@ -280,6 +282,121 @@ class LongHistoryLatentDataset(Dataset):
             "clean_latent": window,
             "idx": idx,
             "video_id": item.get("video_id", str(idx)),
+            "window_start": start,
+        }
+
+
+class LongHistoryVideoDataset(Dataset):
+    """Raw-video window sampler for on-the-fly LR/HR Wan VAE encoding.
+
+    This follows the paper-style data path: keep raw high-resolution/fps video,
+    construct a lower-resolution/fps copy for the DiT input branch, and encode
+    both branches with VAE inside the training step.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        hr_num_frames: int = 480,
+        lr_num_frames: int = 240,
+        hr_size: tuple[int, int] = (480, 832),
+        lr_size: tuple[int, int] = (120, 208),
+        window_sampling: str = "random",
+        pad_short_videos: bool = True,
+        temporal_span_frames: int | None = None,
+        lr_sample_strategy: str = "uniform",
+    ):
+        self.manifest_path = Path(manifest_path)
+        self.root = self.manifest_path.parent
+        self.hr_num_frames = hr_num_frames
+        self.lr_num_frames = lr_num_frames
+        self.temporal_span_frames = temporal_span_frames or hr_num_frames
+        self.lr_sample_strategy = lr_sample_strategy
+        self.hr_size = tuple(hr_size)
+        self.lr_size = tuple(lr_size)
+        self.window_sampling = window_sampling
+        self.pad_short_videos = pad_short_videos
+        self.samples = []
+
+        with open(self.manifest_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.samples.append(json.loads(line))
+        if not self.samples:
+            raise ValueError(f"No samples found in {manifest_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _resolve_path(self, video_path: str) -> Path:
+        path = Path(video_path)
+        if path.is_absolute():
+            return path
+        return self.root / path
+
+    def _select_start(self, num_frames: int, idx: int) -> int:
+        max_start = max(0, num_frames - self.temporal_span_frames)
+        if self.window_sampling == "center":
+            return max_start // 2
+        if self.window_sampling == "sequential":
+            return idx % (max_start + 1)
+        return random.randint(0, max_start)
+
+    def _select_prompt(self, item: dict, window_start: int, window_end: int) -> str:
+        storyboard = item.get("storyboard") or item.get("captions")
+        if not storyboard:
+            return item.get("prompt", item.get("caption", ""))
+
+        center = (window_start + window_end) / 2
+        best = None
+        best_distance = float("inf")
+        for segment in storyboard:
+            text = segment.get("text", segment.get("caption", ""))
+            start = segment.get("start_frame", segment.get("start", 0))
+            end = segment.get("end_frame", segment.get("end", start))
+            midpoint = (start + end) / 2
+            distance = abs(center - midpoint)
+            if distance < best_distance:
+                best = text
+                best_distance = distance
+        return best or item.get("prompt", item.get("caption", ""))
+
+    def _normalize_and_resize(self, frames: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        frames = frames.float().permute(0, 3, 1, 2) / 127.5 - 1.0
+        frames = F.interpolate(frames, size=size, mode="bilinear", align_corners=False)
+        return frames.permute(1, 0, 2, 3).contiguous()
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        video_path = self._resolve_path(item["video_path"])
+        frames, _, _ = read_video(str(video_path), pts_unit="sec", output_format="THWC")
+        if frames.numel() == 0:
+            raise ValueError(f"No frames decoded from {video_path}")
+        num_frames = frames.shape[0]
+        if num_frames < self.temporal_span_frames and not self.pad_short_videos:
+            raise ValueError(
+                f"Video {item.get('video_id', idx)} has {num_frames} frames, needs {self.temporal_span_frames}"
+            )
+
+        start = self._select_start(num_frames, idx)
+        end = start + self.temporal_span_frames
+        hr_ids = torch.linspace(start, end - 1, self.hr_num_frames).round().long().clamp(max=num_frames - 1)
+        hr_frames = frames[hr_ids]
+        if self.lr_sample_strategy == "from_hr":
+            lr_ids = torch.linspace(0, self.hr_num_frames - 1, self.lr_num_frames).round().long()
+            lr_frames = hr_frames[lr_ids]
+        else:
+            lr_ids = torch.linspace(start, end - 1, self.lr_num_frames).round().long().clamp(max=num_frames - 1)
+            lr_frames = frames[lr_ids]
+        prompt = self._select_prompt(item, start, min(end, num_frames))
+
+        return {
+            "prompts": prompt,
+            "hr_frames": self._normalize_and_resize(hr_frames, self.hr_size),
+            "lr_frames": self._normalize_and_resize(lr_frames, self.lr_size),
+            "idx": idx,
+            "video_id": item.get("video_id", video_path.stem),
             "window_start": start,
         }
 

@@ -98,6 +98,42 @@ Captions are useful because the Wan denoiser still expects text conditioning, bu
 frame-preservation pretraining does not require object boxes, segmentation masks,
 identity labels, or per-frame human annotations.
 
+
+## Choosing Wan2.1-T2V-1.3B vs Wan2.1-T2V-14B
+
+The trainable DiT backbone is selected in the YAML config via
+`model_kwargs.model_name`. `WanDiffusionWrapper` resolves this as
+`wan_models/{model_name}/`, so the default config uses:
+
+```yaml
+model_kwargs:
+  model_name: Wan2.1-T2V-1.3B
+  timestep_shift: 5.0
+```
+
+To train against the 14B DiT, download `wan_models/Wan2.1-T2V-14B` and switch to:
+
+```yaml
+model_kwargs:
+  model_name: Wan2.1-T2V-14B
+  timestep_shift: 5.0
+history_context_dim: auto
+```
+
+`history_context_dim: auto` reads the DiT hidden width directly from the loaded
+backbone, so it maps to 1536 for 1.3B and 5120 for 14B. The text encoder and VAE
+wrappers currently load the shared Wan assets from `wan_models/Wan2.1-T2V-1.3B`,
+which matches the existing repository convention and is compatible with either
+T2V DiT size as long as the Wan model folders have been downloaded.
+
+## Is LoRA attached to the DiT?
+
+Yes. `FramePreservationDiffusion` calls `inject_lora_linear` on
+`self.generator.model` when `use_lora: true`. The default target is `blocks.*`,
+so Linear layers inside the Wan DiT transformer blocks are wrapped by LoRA while
+the base Linear weights are frozen. The optimizer then trains the LoRA parameters
+plus the LR/HR history encoder.
+
 ## LR/HR branch defaults
 
 The default `configs/frame_preservation_pretrain.yaml` enables two history branches:
@@ -108,3 +144,46 @@ The default `configs/frame_preservation_pretrain.yaml` enables two history branc
 Both branches use the channel ramp `64 -> 128 -> 256 -> 512 -> 512` and then project
 into `history_context_dim` tokens. For Wan2.1-T2V-1.3B this is `1536`; for larger
 Wan variants, set it to the DiT hidden width used by that checkpoint.
+
+
+## Raw-video LR/HR training path (current default)
+
+The default config now uses `dataset_type: long_history_video_manifest`, so you do
+not have to precompute a single latent stream before training. The dataset reads
+raw videos and returns two resized/fps-sampled tensors:
+
+- HR branch input: `480` video frames resized to `480x832`.
+- LR branch input: `240` frames sampled over the **same temporal span** and resized to `120x208`.
+
+During `train_one_step`, `FramePreservationDiffusion.encode_video_batch()` encodes
+both tensors with the configured Wan VAE. The LR latent stream is used as the DiT
+query/noisy latent stream, while the HR latent stream is fed only to the HR
+history-compression branch. This follows the paper figure more closely than the
+previous precomputed-latent path.
+
+For long videos, `temporal_span_frames` controls how much source-video time the
+window covers. `hr_num_video_frames` and `lr_num_video_frames` are then sampled
+uniformly over that same span, so LR and HR cover the same time range but have
+different frame rates. For example, `temporal_span_frames: 960`,
+`hr_num_video_frames: 480`, and `lr_num_video_frames: 240` covers twice the time
+span at half/double effective sampling rates without changing model input sizes.
+
+Minimal raw-video manifest:
+
+```jsonl
+{"video_id":"clip_0001","video_path":"videos/clip_0001.mp4","prompt":"A horse runs in a field."}
+{"video_id":"clip_0002","video_path":"videos/clip_0002.mp4","prompt":""}
+```
+
+Storyboard fields are still optional and use raw video frame indices for this
+raw-video dataset. No manual object/mask labels are required.
+
+## Wan2.2 note
+
+Wan2.2-TI2V-5B exposes `Wan2.2_VAE.pth`, T5 weights, config JSON, and sharded
+Diffusers-style safetensors on Hugging Face. The current patch makes the VAE and
+text encoder folder/checkpoint configurable (`vae_model_name`, `vae_checkpoint`,
+`text_encoder_model_name`) and keeps the DiT folder selected by
+`model_kwargs.model_name`. A full Wan2.2 DiT loader may still require a dedicated
+adapter because this repository's `WanModel.from_pretrained` was originally built
+around the Wan2.1 folder/checkpoint layout.

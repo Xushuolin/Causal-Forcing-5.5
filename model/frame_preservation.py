@@ -120,12 +120,18 @@ class LightweightHistoryEncoder(nn.Module):
             num_attention_heads=num_attention_heads,
         ) if use_hr_branch else None
 
-    def forward(self, history_latents: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        lr_history_latents: torch.Tensor,
+        hr_history_latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         branches = []
         if self.lr_branch is not None:
-            branches.append(self.lr_branch(history_latents))
+            branches.append(self.lr_branch(lr_history_latents))
         if self.hr_branch is not None:
-            branches.append(self.hr_branch(history_latents))
+            if hr_history_latents is None:
+                hr_history_latents = lr_history_latents
+            branches.append(self.hr_branch(hr_history_latents))
         return torch.cat(branches, dim=1)
 
 
@@ -140,7 +146,11 @@ class FramePreservationDiffusion(BaseModel):
         self.history_noise_min_timestep = getattr(args, "history_noise_min_timestep", 200)
         self.history_noise_max_timestep = getattr(args, "history_noise_max_timestep", 1000)
 
-        context_dim = getattr(args, "history_context_dim", self.generator.model.dim)
+        context_dim = getattr(args, "history_context_dim", "auto")
+        if context_dim in (None, "auto"):
+            context_dim = self.generator.model.dim
+        else:
+            context_dim = int(context_dim)
         hidden_channels = tuple(getattr(args, "history_hidden_channels", [64, 128, 256, 512, 512]))
         compression_rate = tuple(getattr(args, "history_compression_rate", [4, 4, 2]))
         self.history_encoder = LightweightHistoryEncoder(
@@ -178,14 +188,36 @@ class FramePreservationDiffusion(BaseModel):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=False)
         self.generator.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
+        self.text_encoder = WanTextEncoder(
+            model_name=getattr(args, "text_encoder_model_name", "Wan2.1-T2V-1.3B")
+        )
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(
+            model_name=getattr(args, "vae_model_name", "Wan2.1-T2V-1.3B"),
+            vae_checkpoint=getattr(args, "vae_checkpoint", "Wan2.1_VAE.pth"),
+        )
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
+
+    def encode_video_batch(self, batch: dict, device, dtype) -> dict[str, torch.Tensor]:
+        hr_frames = batch["hr_frames"].to(device=device, dtype=dtype)
+        lr_frames = batch["lr_frames"].to(device=device, dtype=dtype)
+        with torch.no_grad():
+            hr_latent = self.vae.encode_to_latent(hr_frames).to(device=device, dtype=dtype)
+            lr_latent = self.vae.encode_to_latent(lr_frames).to(device=device, dtype=dtype)
+        return {"hr": hr_latent, "lr": lr_latent}
+
+    @staticmethod
+    def _expand_query_mask(query_mask: torch.Tensor, target_frames: int) -> torch.Tensor:
+        if query_mask.shape[1] == target_frames:
+            return query_mask
+        scale = target_frames / query_mask.shape[1]
+        ids = torch.arange(target_frames, device=query_mask.device)
+        source_ids = torch.clamp((ids / scale).floor().long(), max=query_mask.shape[1] - 1)
+        return query_mask[:, source_ids]
 
     def _sample_query_mask(self, batch_size: int, num_frames: int, device) -> torch.Tensor:
         query_count = min(self.num_query_frames, num_frames)
@@ -227,13 +259,25 @@ class FramePreservationDiffusion(BaseModel):
         clean_latent: torch.Tensor,
         initial_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
-        batch_size, num_frames = clean_latent.shape[:2]
-        query_mask = self._sample_query_mask(batch_size, num_frames, clean_latent.device)
-        masked_history = self._build_masked_history(clean_latent, query_mask)
-        history_context = self.history_encoder(masked_history)
+        if isinstance(clean_latent, dict):
+            lr_clean_latent = clean_latent["lr"]
+            hr_clean_latent = clean_latent.get("hr")
+        else:
+            lr_clean_latent = clean_latent
+            hr_clean_latent = None
 
-        query_latents = clean_latent[query_mask].reshape(
-            batch_size, -1, *clean_latent.shape[2:]
+        batch_size, num_frames = lr_clean_latent.shape[:2]
+        query_mask = self._sample_query_mask(batch_size, num_frames, lr_clean_latent.device)
+        lr_masked_history = self._build_masked_history(lr_clean_latent, query_mask)
+        if hr_clean_latent is not None:
+            hr_query_mask = self._expand_query_mask(query_mask, hr_clean_latent.shape[1])
+            hr_masked_history = self._build_masked_history(hr_clean_latent, hr_query_mask)
+        else:
+            hr_masked_history = None
+        history_context = self.history_encoder(lr_masked_history, hr_masked_history)
+
+        query_latents = lr_clean_latent[query_mask].reshape(
+            batch_size, -1, *lr_clean_latent.shape[2:]
         )
         query_frames = query_latents.shape[1]
         noise = torch.randn_like(query_latents)
@@ -266,6 +310,6 @@ class FramePreservationDiffusion(BaseModel):
         return loss, {
             "x0": query_latents.detach(),
             "x0_pred": x0_pred.detach(),
-            "history_context_tokens": torch.tensor(history_context.shape[1], device=clean_latent.device),
-            "num_lora_layers": torch.tensor(self.num_lora_layers, device=clean_latent.device),
+            "history_context_tokens": torch.tensor(history_context.shape[1], device=lr_clean_latent.device),
+            "num_lora_layers": torch.tensor(self.num_lora_layers, device=lr_clean_latent.device),
         }
