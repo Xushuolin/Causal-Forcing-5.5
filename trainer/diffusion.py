@@ -1,8 +1,8 @@
 import gc
 import logging
 
-from model import CausalDiffusion
-from utils.dataset import cycle, LatentLMDBDataset
+from model import CausalDiffusion, FramePreservationDiffusion
+from utils.dataset import cycle, LatentLMDBDataset, LongHistoryLatentDataset, LongHistoryVideoDataset
 from utils.misc import set_seed
 import torch.distributed as dist
 from omegaconf import OmegaConf
@@ -57,7 +57,10 @@ class Trainer:
         self.output_path = config.logdir
 
         # Step 2: Initialize the model and optimizer
-        self.model = CausalDiffusion(config, device=self.device)
+        if getattr(config, "diffusion_objective", "causal_teacher_forcing") == "frame_preservation":
+            self.model = FramePreservationDiffusion(config, device=self.device)
+        else:
+            self.model = CausalDiffusion(config, device=self.device)
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -72,21 +75,56 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy
         )
 
+        if hasattr(self.model, "history_encoder"):
+            self.model.history_encoder = fsdp_wrap(
+                self.model.history_encoder,
+                sharding_strategy=getattr(config, "history_encoder_sharding_strategy", config.sharding_strategy),
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=getattr(config, "history_encoder_fsdp_wrap_strategy", "size"),
+            )
+
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        trainable_params = [param for param in self.model.generator.parameters() if param.requires_grad]
+        if hasattr(self.model, "history_encoder"):
+            trainable_params.extend(
+                param for param in self.model.history_encoder.parameters() if param.requires_grad
+            )
+
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            trainable_params,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
 
         # Step 3: Initialize the dataloader
-        dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
-       
+        dataset_type = getattr(config, "dataset_type", "lmdb_latent")
+        if dataset_type == "long_history_manifest":
+            dataset = LongHistoryLatentDataset(
+                config.data_path,
+                sequence_length=getattr(config, "history_sequence_length", config.image_or_video_shape[1]),
+                frame_stride=getattr(config, "history_frame_stride", 1),
+                window_sampling=getattr(config, "history_window_sampling", "random"),
+                pad_short_videos=getattr(config, "pad_short_videos", True),
+            )
+        elif dataset_type == "long_history_video_manifest":
+            dataset = LongHistoryVideoDataset(
+                config.data_path,
+                hr_num_frames=getattr(config, "hr_num_video_frames", 480),
+                lr_num_frames=getattr(config, "lr_num_video_frames", 240),
+                hr_size=tuple(getattr(config, "hr_video_size", [480, 832])),
+                lr_size=tuple(getattr(config, "lr_video_size", [120, 208])),
+                window_sampling=getattr(config, "history_window_sampling", "random"),
+                pad_short_videos=getattr(config, "pad_short_videos", True),
+                temporal_span_frames=getattr(config, "temporal_span_frames", None),
+                lr_sample_strategy=getattr(config, "lr_sample_strategy", "uniform"),
+            )
+        else:
+            dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
+
         self.dataset = dataset
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
@@ -108,12 +146,15 @@ class Trainer:
             .replace("_orig_mod.", "")
         )
         self.name_to_trainable_params = {}
-        for n, p in self.model.generator.named_parameters():
-            if not p.requires_grad:
+        for module_prefix, module in [("generator", self.model.generator), ("history_encoder", getattr(self.model, "history_encoder", None))]:
+            if module is None:
                 continue
+            for n, p in module.named_parameters():
+                if not p.requires_grad:
+                    continue
 
-            renamed_n = rename_param(n)
-            self.name_to_trainable_params[renamed_n] = p
+                renamed_n = rename_param(f"{module_prefix}.{n}")
+                self.name_to_trainable_params[renamed_n] = p
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
@@ -144,6 +185,13 @@ class Trainer:
                     fixed[k] = v
                 state_dict = fixed
             self.model.generator.load_state_dict(state_dict, strict=True)
+
+        if hasattr(self.model, "history_encoder") and getattr(config, "history_encoder_ckpt", False):
+            print(f"Loading pretrained history encoder from {config.history_encoder_ckpt}")
+            history_state = torch.load(config.history_encoder_ckpt, map_location="cpu")
+            if "history_encoder" in history_state:
+                history_state = history_state["history_encoder"]
+            self.model.history_encoder.load_state_dict(history_state, strict=True)
 
         ##############################################################################################################
 
@@ -179,6 +227,8 @@ class Trainer:
             state_dict = {
                 "generator": generator_state_dict,
             }
+        if hasattr(self.model, "history_encoder"):
+            state_dict["history_encoder"] = fsdp_state_dict(self.model.history_encoder)
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
@@ -196,17 +246,19 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
-        if not self.config.load_raw_video:  # precomputed latent
+        if hasattr(self.model, "encode_video_batch") and "hr_frames" in batch and "lr_frames" in batch:
+            clean_latent = self.model.encode_video_batch(batch, device=self.device, dtype=self.dtype)
+        elif not self.config.load_raw_video:  # precomputed latent
             clean_latent = batch["clean_latent"].to(
                 device=self.device, dtype=self.dtype)
         else:  # encode raw video to latent
             frames = batch["frames"].to(
                 device=self.device, dtype=self.dtype)
-           
+
             with torch.no_grad():
                 clean_latent = self.model.vae.encode_to_latent(
                     frames).to(device=self.device, dtype=self.dtype)
-        image_latent = clean_latent[:, 0:1, ]
+        image_latent = clean_latent["lr"][:, 0:1, ] if isinstance(clean_latent, dict) else clean_latent[:, 0:1, ]
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -237,6 +289,8 @@ class Trainer:
         generator_loss.backward()
         generator_grad_norm = self.model.generator.clip_grad_norm_(
             self.max_grad_norm)
+        if hasattr(self.model, "history_encoder"):
+            self.model.history_encoder.clip_grad_norm_(self.max_grad_norm)
         self.generator_optimizer.step()
 
         # Increment the step since we finished gradient update

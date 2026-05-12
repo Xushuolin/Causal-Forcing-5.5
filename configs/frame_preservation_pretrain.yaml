@@ -1,0 +1,134 @@
+# Stage-1 reproduction scaffold for arXiv:2512.23851:
+# Pretraining Frame Preservation for Lightweight Autoregressive Video History Embedding.
+# Train an LR/HR lightweight history encoder plus DiT LoRA with random
+# frame-query supervision over long precomputed latent windows.
+
+diffusion_objective: frame_preservation
+trainer: diffusion
+causal: false
+
+# Wan / diffusion settings
+generator_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+history_encoder_fsdp_wrap_strategy: size
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 0
+sharding_strategy: hybrid_full
+lr: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 2000000000
+log_iters: 1000
+gc_interval: 100
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+gradient_checkpointing: true
+load_raw_video: true
+image_or_video_shape:
+- 1
+- 60
+- 16
+- 15
+- 26
+model_kwargs:
+  # Generator checkpoint folder under wan_models/{model_name}/. For Wan2.2,
+  # switch to Wan2.2-TI2V-5B once the Wan2.2 DiT loader is available.
+  model_name: Wan2.1-T2V-1.3B
+  timestep_shift: 5.0
+# Wan2.2-style VAE path can be selected independently of the DiT loader.
+vae_model_name: Wan2.1-T2V-1.3B
+vae_checkpoint: Wan2.1_VAE.pth
+text_encoder_model_name: Wan2.1-T2V-1.3B
+
+# Raw-video data path. This follows the paper figure more closely than
+# precomputing a single latent stream: HR and LR videos are resized/fps-sampled,
+# then encoded by VAE on the fly inside the training step.
+dataset_type: long_history_video_manifest
+data_path: dataset/frame_preservation_videos.jsonl
+# All streams cover the same temporal span. Increase temporal_span_frames to
+# sample a wider time range from long videos while keeping fixed model input
+# frame counts. Example: temporal_span_frames: 960 spans twice as long as 480.
+temporal_span_frames: 480
+hr_num_video_frames: 480
+lr_num_video_frames: 240
+lr_sample_strategy: uniform
+hr_video_size:
+- 480
+- 832
+lr_video_size:
+- 120
+- 208
+history_sequence_length: 60 # LR latent frames after VAE temporal compression
+history_window_sampling: random
+pad_short_videos: true
+
+# Frame-query objective: randomly keep Ω clean and corrupt the rest of history.
+num_query_frames: 4
+query_sampling: random
+history_noise_min_timestep: 200
+history_noise_max_timestep: 1000
+
+# LR/HR lightweight history encoder. The channel ramp follows the paper's
+# experiment-section implementation note: 64 -> 128 -> 256 -> 512, then stay
+# at 512 before projecting to the DiT context/inner channel width.
+latent_channels: 16
+history_context_dim: auto # auto uses generator.model.dim: 1536 for 1.3B, 5120 for 14B
+history_num_attention_heads: 8
+use_lr_branch: true
+use_hr_branch: true
+lr_hidden_channels:
+- 64
+- 128
+- 256
+- 512
+- 512
+hr_hidden_channels:
+- 64
+- 128
+- 256
+- 512
+- 512
+# LR branch receives the low-res VAE latent stream, matching the paper
+# path h120w208f240 -> latent 15x26x60x16 before DiT patchify.
+lr_compression_rate:
+- 4
+- 4
+- 2
+# HR branch receives the high-res/high-fps VAE latent stream, matching the paper
+# path h480w832f480 -> latent 60x104x120x16 before compression.
+hr_compression_rate:
+- 2
+- 2
+- 1
+# Backward-compatible aliases used when branch-specific values are omitted.
+history_hidden_channels:
+- 64
+- 128
+- 256
+- 512
+- 512
+history_compression_rate:
+- 4
+- 4
+- 2
+
+# DiT LoRA strategy. The paper uses rank 128 for DiT LoRAs; by default we
+# freeze the base Wan DiT and train only Linear LoRA adapters inside blocks.*.
+use_lora: true
+lora_rank: 128
+lora_alpha: 128
+lora_dropout: 0.0
+lora_target_modules:
+- blocks.*
+
+# W&B placeholders, inherited by train.py.
+wandb_host: https://api.wandb.ai
+wandb_key: {your key}
+wandb_entity: {your entity}
+wandb_project: {your project}

@@ -647,6 +647,7 @@ class WanModel(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        history_context=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -710,6 +711,9 @@ class WanModel(ModelMixin, ConfigMixin):
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+
+        if history_context is not None:
+            context = torch.concat([history_context.to(device=context.device, dtype=context.dtype), context], dim=1)
 
         # arguments
         kwargs = dict(
@@ -780,6 +784,7 @@ class WanModel(ModelMixin, ConfigMixin):
         cls_pred_branch,
         clip_fea=None,
         y=None,
+        history_context=None,
     ):
         r"""
         Feature extraction through the diffusion model
@@ -843,6 +848,9 @@ class WanModel(ModelMixin, ConfigMixin):
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+
+        if history_context is not None:
+            context = torch.concat([history_context.to(device=context.device, dtype=context.dtype), context], dim=1)
 
         # arguments
         kwargs = dict(

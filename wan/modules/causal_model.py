@@ -725,7 +725,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        history_context=None
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -798,6 +799,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
+        if history_context is not None:
+            context = torch.concat([history_context.to(device=context.device, dtype=context.dtype), context], dim=1)
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -855,6 +859,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        history_context=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -948,6 +953,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
+
+        if history_context is not None:
+            context = torch.concat([history_context.to(device=context.device, dtype=context.dtype), context], dim=1)
 
         if clean_x is not None:
             # clean_x.detach()
